@@ -1,0 +1,251 @@
+name: Distrib
+
+on:
+  workflow_call:
+    inputs:
+      k6-version:
+        description: The k6 versions to be used.
+        type: string
+        required: false
+        default: "latest"
+      xk6-version:
+        description: The xk6 versions to be used.
+        type: string
+        required: false
+      go-version:
+        description: The go version to use for the build.
+        type: string
+        required: false
+        default: "1.25.x"
+      os:
+        description: Target GOOS values. JSON string array (e.g. ["linux","windows","darwin"])
+        type: string
+        required: false
+        default: '["linux"]'
+      arch:
+        description: Target GOARCH values. JSON string array (e.g. ["amd64","arm64"])
+        type: string
+        default: '["amd64"]'
+        required: false
+      manifest:
+        description: The markdown file to be used for build manifest.
+        type: string
+        required: false
+        default: "README.md"
+      cgo:
+        description: Enable CGO
+        type: boolean
+
+jobs:
+  config:
+    name: Config
+    runs-on: ubuntu-latest
+    outputs:
+      module-path: ${{steps.module.outputs.path}}
+      repository-name: ${{steps.repository.outputs.name}}
+      version: ${{steps.version.outputs.version}}
+      with: ${{steps.with.outputs.with}}
+      cgo: ${{steps.cgo.outputs.cgo}}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Detect go module path
+        id: module
+        shell: bash
+        run: |
+          echo "path=$(go list -f '{{.Module.Path}}')" >> $GITHUB_OUTPUT
+      - name: Parse repository name
+        id: repository
+        shell: bash
+        run: |
+          echo "name=$(echo ${{github.repository}}|cut -d/ -f2)" >> $GITHUB_OUTPUT
+      - name: Version from input or tag
+        id: version
+        shell: bash
+        env:
+          REF_TYPE: ${{github.ref_type}}
+          REF_NAME: ${{github.ref_name}}
+        run: |
+          if [ "${REF_TYPE}" == "tag" ]; then
+            echo "version=${REF_NAME}" >> $GITHUB_OUTPUT
+          else
+            echo "The run was not triggered by a git tag push." >&2
+            exit 1
+          fi
+      - name: Prepare extra --with arguments
+        id: with
+        shell: bash
+        env:
+          MANIFEST: ${{inputs.manifest}}
+          GH_TOKEN: ${{github.token}}
+        run: |
+          gh release download -R szkiba/md2xk6 --pattern "*linux_amd64*"
+          tar xzf md2xk6*tar.gz md2xk6
+
+          echo "with=$(./md2xk6 ${MANIFEST})" >> $GITHUB_OUTPUT
+      - name: Prepare CGO environment valiable
+        id: cgo
+        shell: bash
+        env:
+          CGO: ${{inputs.cgo}}
+        run: |
+          cgo="0"
+          if [ "${CGO}" == "true" ]; then
+            cgo="1"
+          fi
+          echo "cgo=${cgo}" >> $GITHUB_OUTPUT
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: files
+          path: |
+            LICENSE*
+            README.md
+      - name: Summary
+        env:
+          GO_VERSION: ${{ inputs.go-version }}
+          K6_VERSION: ${{ inputs.k6-version }}
+          XK6_VERSION: ${{ inputs.xk6-version }}
+          MANIFEST: ${{ inputs.manifest }}
+          WITH: ${{ steps.with.outputs.with }}
+          CGO: ${{ steps.cgo.outputs.cgo }}
+          OS: ${{ join(fromJSON(inputs.os),', ') }}
+          ARCH: ${{ join(fromJSON(inputs.arch),', ') }}
+          REF_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY <<END
+
+          ## ${REF_NAME}
+
+          ### Configuration
+
+          Description          | Value
+          ------------|-----------------------------
+          go version  | ${GO_VERSION}
+          k6 version  | ${K6_VERSION}
+          xk6 version | ${XK6_VERSION}
+          os          | ${OS}
+          arch        | ${ARCH}
+          with        | ${WITH}
+          manifest    | ${MANIFEST}
+          cgo         | ${CGO}
+
+          END
+
+  build:
+    name: Build
+    needs: ["config"]
+    strategy:
+      matrix:
+        os: ${{ fromJSON(inputs.os) }}
+        arch: ${{ fromJSON(inputs.arch) }}
+    env:
+      DIST_DIR: ${{needs.config.outputs.repository-name}}_${{needs.config.outputs.version}}_${{matrix.os}}_${{matrix.arch}}
+      VERSION_FILE: version.json
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Setup Go ${{ inputs.go-version }}
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ inputs.go-version }}
+
+      - name: Setup xk6 ${{ inputs.xk6-version }}
+        uses: grafana/setup-xk6@v1.0.0
+        with:
+          xk6-version: ${{ inputs.xk6-version }}
+
+      - name: Build k6
+        shell: bash
+        env:
+          GOOS: ${{matrix.os}}
+          GOARCH: ${{matrix.arch}}
+          CGO: ${{needs.config.outputs.cgo}}
+          GH_TOKEN: ${{github.token}}
+          K6_VERSION: ${{ inputs.k6-version }}
+          WITH: ${{needs.config.outputs.with}}
+        run: |
+          mkdir -p $DIST_DIR
+          cd $DIST_DIR
+          git config --global --add 'credential.https://github.com.helper' '!gh auth git-credential'
+          xk6 build -v ${WITH}
+
+          if [ "${GOOS}" == "linux" -a "${GOARCH}" == "amd64" ]; then
+            ./k6 version --json > ../${VERSION_FILE}
+          fi
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: ${{env.DIST_DIR}}
+          name: files
+
+      - name: Create Archive
+        shell: bash
+        env:
+          OS: ${{matrix.os}}
+        run: |
+          if [ "${OS}" == "windows" ]; then
+            zip -r ${DIST_DIR}.zip $DIST_DIR
+          else
+            tar czf ${DIST_DIR}.tar.gz $DIST_DIR
+          fi
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          path: |
+            ${{env.DIST_DIR}}.*
+            ${{env.VERSION_FILE}}*
+          name: archive-${{matrix.os}}_${{matrix.arch}}
+
+  publish:
+    name: Publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    needs:
+      - build
+      - config
+    env:
+      VERSION_FILE: version.json
+      NOTES_FILE: release_notes.md
+      GH_TOKEN: ${{github.token}}
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: dist
+          merge-multiple: true
+          pattern: archive-*
+
+      - name: Generate version info
+        shell: bash
+        run: |
+          gh release download -R hairyhenderson/gomplate -p gomplate_linux-amd64 -O gomplate
+          chmod +x gomplate
+
+          ./gomplate -d version=dist/${VERSION_FILE} <<'EOF' > ${NOTES_FILE}
+          {{with (ds "version")}}
+          This is a custom **k6 [{{.version}}](https://github.com/grafana/k6/releases/tag/{{.version}})** release {{if has . "extensions"}}with extensions:
+
+          Extension | Version
+          --------- | -------
+          {{- range .extensions}}
+          {{printf "[%s](https://%s)" .module .module}} | {{if strings.HasPrefix "github.com" .module }}[{{.version}}](https://{{.module}}/releases/tag/{{.version}}){{else}}{{if strings.HasPrefix "gitlab.com" .module }}[{{.version}}](https://{{.module}}/-/releases/{{.version}}){{else}}{{.version}}{{end}}{{end}}{{end}}
+          {{else}} without extensions.
+          {{end}}
+          {{end}}
+          EOF
+
+      - name: Create Release
+        uses: softprops/action-gh-release@6cbd405e2c4e67a21c47fa9e383d020e4e28b836 # v2.3.3
+        with:
+          files: dist/*
+          tag_name: ${{needs.config.outputs.version}}
+          append_body: true
+          body_path: ${{env.NOTES_FILE}}
