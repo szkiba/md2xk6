@@ -21,11 +21,11 @@ on:
         description: Target GOOS values. JSON string array (e.g. ["linux","windows","darwin"])
         type: string
         required: false
-        default: '["linux"]'
+        default: '["linux","windows","darwin"]'
       arch:
         description: Target GOARCH values. JSON string array (e.g. ["amd64","arm64"])
         type: string
-        default: '["amd64"]'
+        default: '["amd64","arm64"]'
         required: false
       manifest:
         description: The markdown file to be used for build manifest.
